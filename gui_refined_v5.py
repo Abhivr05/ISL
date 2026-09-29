@@ -4,7 +4,7 @@
 
 REAL-TIME INDIAN SIGN LANGUAGE RECOGNITION & BASIC SENTENCE GENERATION
 
-Framework: PyQt5 Desktop UI + OpenCV + MediaPipe Holistic + PyTorch TCN (V3)
+Framework: PyQt5 Desktop UI + OpenCV + MediaPipe Holistic + PyTorch TCN (V5)
 
 Checkpoint: trained_models/isl_tcn_19class_v3.pth (18 Active Classes)
 
@@ -148,8 +148,23 @@ class ISLInferenceWorker(QThread):
         self.strong_margin_threshold = 0.30
         self.min_confidence_margin = 0.15
 
-        self.motion_threshold = 0.020
+        # Slightly lower start threshold so subtle signs are not skipped.
+        # Motion is still required, but hand presence is also checked.
+        self.motion_threshold = 0.015
         self.motion_burst_required = 2
+
+        # Gesture segmentation: do not assume every sign occupies all 30
+        # camera frames. The model still receives exactly 30 frames, but a
+        # shorter completed gesture is temporally resampled to 30 frames.
+        self.min_gesture_frames = 10
+        self.release_motion_frames = 3
+        self.release_decay_ratio = 0.50
+        self.max_gesture_frames = 45
+
+        # Reject clearly unreliable MediaPipe pose frames before they enter
+        # the sequence. Do NOT require a hand here: YES/NO can be expressed
+        # mainly through pose/head movement.
+        self.min_shoulder_visibility = 0.50
 
         # The previously working recognizer used 0 here.
         # This prevents idle frames from contaminating the gesture.
@@ -181,6 +196,43 @@ class ISLInferenceWorker(QThread):
             window_size=self.smoothing_window,
             confidence_threshold=self.confidence_threshold
         )
+
+    def landmark_quality_ok(self, results, normalized_features):
+        """Return True when the current MediaPipe frame is usable for inference.
+
+        Pose landmarks and both shoulder landmarks must be reliable enough
+        for the existing normalization. Hand visibility is deliberately NOT
+        required because some active classes, especially YES/NO, do not rely
+        on hand landmarks.
+        """
+        try:
+            if not results.pose_landmarks:
+                return False
+
+            pose = results.pose_landmarks.landmark
+            if len(pose) < 13:
+                return False
+
+            left_shoulder = pose[11]
+            right_shoulder = pose[12]
+
+            if (
+                left_shoulder.visibility < self.min_shoulder_visibility
+                or right_shoulder.visibility < self.min_shoulder_visibility
+            ):
+                return False
+
+            features = np.asarray(normalized_features, dtype=np.float32)
+            if features.shape != (self.feature_dimension,):
+                return False
+
+            if not np.all(np.isfinite(features)):
+                return False
+
+            return True
+
+        except Exception:
+            return False
 
     @staticmethod
     def calculate_motion(current_features, previous_features):
@@ -252,6 +304,36 @@ class ISLInferenceWorker(QThread):
 
         return True
 
+    @staticmethod
+    def temporal_resample(sequence, target_length=30):
+        """Resample a completed gesture to the model's fixed frame length.
+
+        The TCN was trained on 30-frame sequences. A live sign may finish in
+        fewer than 30 frames, so instead of padding the rest with idle frames,
+        interpolate the complete gesture trajectory to exactly 30 frames.
+        """
+        sequence = np.asarray(sequence, dtype=np.float32)
+
+        if sequence.ndim != 2 or len(sequence) == 0:
+            return None
+
+        if len(sequence) == target_length:
+            return sequence.copy()
+
+        if len(sequence) == 1:
+            return np.repeat(sequence, target_length, axis=0)
+
+        old_x = np.linspace(0.0, 1.0, len(sequence))
+        new_x = np.linspace(0.0, 1.0, target_length)
+        result = np.empty((target_length, sequence.shape[1]), dtype=np.float32)
+
+        for feature_idx in range(sequence.shape[1]):
+            result[:, feature_idx] = np.interp(
+                new_x, old_x, sequence[:, feature_idx]
+            )
+
+        return result
+
     def run(self):
         device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -307,12 +389,17 @@ class ISLInferenceWorker(QThread):
             holistic.close()
             return
 
-        sequence_buffer = deque(maxlen=self.sequence_length)
-        pre_motion_buffer = deque(maxlen=self.pre_motion_frames)
+        # Candidate gesture can be shorter or slightly longer than 30 raw
+        # frames. It is converted to exactly 30 frames only when classified.
+        sequence_buffer = deque(maxlen=self.max_gesture_frames)
+        pre_motion_buffer = deque(maxlen=5)
 
         previous_features = None
         state = "IDLE"
         movement_count = 0
+        release_motion_count = 0
+        last_accepted_prediction = None
+        release_ready = True
 
         current_prediction = "Waiting..."
         current_confidence = 0.0
@@ -409,23 +496,38 @@ class ISLInferenceWorker(QThread):
                 dtype=np.float32
             )
 
+            frame_quality_ok = self.landmark_quality_ok(
+                results,
+                normalized_features
+            )
+
             motion = self.calculate_motion(
                 normalized_features,
                 previous_features
             )
             previous_features = normalized_features.copy()
 
-            is_moving = motion > self.motion_threshold
+            # Motion is only allowed to start a gesture when MediaPipe is
+            # actually tracking the pose and at least one hand. This avoids
+            # opening capture windows because of noisy body/landmark motion.
+            is_moving = (
+                frame_quality_ok
+                and motion > self.motion_threshold
+            )
 
-            if self.pre_motion_frames > 0:
+            if self.pre_motion_frames > 0 and frame_quality_ok:
                 pre_motion_buffer.append(
                     normalized_features.copy()
                 )
 
             # ========================================================
-            # IDLE
+            # IDLE / GESTURE CAPTURE
             # ========================================================
             if state == "IDLE":
+
+                # Keep a small history so the first frames of a fast gesture
+                # are not lost while the motion gate is arming.
+                pre_motion_buffer.append(normalized_features.copy())
 
                 if is_moving:
                     movement_count += 1
@@ -433,102 +535,126 @@ class ISLInferenceWorker(QThread):
                     movement_count = 0
 
                 if movement_count >= self.motion_burst_required:
-
                     state = "CAPTURING"
                     sequence_buffer.clear()
+                    release_motion_count = 0
+                    peak_motion = 0.0
+                    movement_count = 0
 
-                    # Normally empty because pre_motion_frames=0.
+                    # Include the short lead-in, then continue collecting.
                     for previous_frame in pre_motion_buffer:
                         sequence_buffer.append(previous_frame)
 
-                    sequence_buffer.append(
-                        normalized_features.copy()
-                    )
+                    if not sequence_buffer or not np.array_equal(
+                        sequence_buffer[-1], normalized_features
+                    ):
+                        sequence_buffer.append(normalized_features.copy())
 
-                    movement_count = 0
                     self.reset_smoother()
 
-            # ========================================================
-            # CAPTURING
-            # ========================================================
             elif state == "CAPTURING":
 
-                sequence_buffer.append(
-                    normalized_features.copy()
+                if frame_quality_ok:
+                    sequence_buffer.append(normalized_features.copy())
+
+                # Adaptive gesture-end detection. V5 uses a slightly slower release than V4. A fixed number of
+                # low-motion frames is unreliable for fast signers. Instead,
+                # remember the motion peak of the current gesture and look
+                # for a clear decay after that peak. This lets a fast sign
+                # finish quickly without cutting it at the first quiet frame.
+                if frame_quality_ok:
+                    peak_motion = max(peak_motion, motion)
+
+                motion_has_decayed = (
+                    peak_motion >= self.motion_threshold
+                    and motion <= peak_motion * self.release_decay_ratio
                 )
 
-                if len(sequence_buffer) >= self.sequence_length:
+                if frame_quality_ok and motion_has_decayed:
+                    release_motion_count += 1
+                elif is_moving:
+                    release_motion_count = 0
 
-                    sequence = np.array(
-                        sequence_buffer,
-                        dtype=np.float32
-                    )[:self.sequence_length]
+                gesture_finished = (
+                    len(sequence_buffer) >= self.min_gesture_frames
+                    and release_motion_count >= self.release_motion_frames
+                )
 
-                    (
-                        prediction,
-                        confidence,
-                        second_confidence,
-                        confidence_margin,
-                        second_class
-                    ) = self.predict_sequence(
-                        model,
-                        device,
-                        sequence
+                # Safety fallback: very long gestures are classified at 45
+                # frames rather than waiting indefinitely.
+                force_classify = (
+                    len(sequence_buffer) >= self.max_gesture_frames
+                )
+
+                # Normal case: sign has finished before the 30-frame limit.
+                # Fallback: a long sign reaches the maximum capture length.
+                if gesture_finished or force_classify:
+                    raw_sequence = np.array(
+                        sequence_buffer, dtype=np.float32
                     )
 
-                    if prediction is not None:
+                    sequence = self.temporal_resample(
+                        raw_sequence, self.sequence_length
+                    )
 
-                        sequence_motion = (
-                            self.calculate_sequence_motion(sequence)
+                    if sequence is not None:
+                        (
+                            prediction,
+                            confidence,
+                            second_confidence,
+                            confidence_margin,
+                            second_class
+                        ) = self.predict_sequence(
+                            model, device, sequence
                         )
 
-                        current_prediction = prediction
-                        current_confidence = confidence
-                        second_prediction = second_class
-                        second_confidence = second_confidence
+                        if prediction is not None:
+                            sequence_motion = self.calculate_sequence_motion(
+                                sequence
+                            )
 
-                        # Preserve the previously working acceptance
-                        # behavior, including strong NO/YES-type signs.
-                        strong_prediction = (
-                            confidence >=
-                            self.strong_confidence_threshold
-                            and
-                            confidence_margin >=
-                            self.strong_margin_threshold
-                        )
+                            current_prediction = prediction
+                            current_confidence = confidence
+                            second_prediction = second_class
 
-                        normal_prediction = (
-                            confidence >=
-                            self.confidence_threshold
-                            and
-                            confidence_margin >=
-                            self.min_confidence_margin
-                            and
-                            sequence_motion >=
-                            self.motion_threshold
-                        )
+                            strong_prediction = (
+                                confidence >= self.strong_confidence_threshold
+                                and confidence_margin >= self.strong_margin_threshold
+                            )
 
-                        if strong_prediction or normal_prediction:
-                            self.accept_word(prediction)
+                            normal_prediction = (
+                                confidence >= self.confidence_threshold
+                                and confidence_margin >= self.min_confidence_margin
+                                and sequence_motion >= self.motion_threshold
+                            )
 
-                    # ------------------------------------------------
-                    # Reset for next gesture.
-                    # Do NOT use overlapping inference here.
-                    # This is the behavior of the known-good version.
-                    # ------------------------------------------------
-                    recent_frames = list(pre_motion_buffer)
+                            if strong_prediction or normal_prediction:
+                                can_accept = (
+                                    prediction != last_accepted_prediction
+                                    or release_ready
+                                )
 
+                                if can_accept:
+                                    accepted = self.accept_word(prediction)
+                                    if accepted:
+                                        last_accepted_prediction = prediction
+                                        release_ready = False
+
+                    # Finished gesture: return to IDLE. The 5-frame history
+                    # remains available to catch the beginning of the next
+                    # sign, so continuous signing does not require a long
+                    # idle position between words.
                     sequence_buffer.clear()
-
-                    for previous_frame in recent_frames:
-                        sequence_buffer.append(previous_frame)
-
-                    while len(sequence_buffer) > self.sequence_length - 1:
-                        sequence_buffer.popleft()
-
-                    movement_count = 0
                     state = "IDLE"
+                    movement_count = 0
+                    release_motion_count = 0
+                    peak_motion = 0.0
+                    release_ready = True
                     self.reset_smoother()
+
+                    # A new moving gesture is allowed to re-arm immediately.
+                    # Same-word repetition becomes available after this
+                    # completed low-motion gesture.
 
             # ========================================================
             # SENTENCE

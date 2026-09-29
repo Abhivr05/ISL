@@ -148,8 +148,15 @@ class ISLInferenceWorker(QThread):
         self.strong_margin_threshold = 0.30
         self.min_confidence_margin = 0.15
 
-        self.motion_threshold = 0.020
+        # Slightly lower start threshold so subtle signs are not skipped.
+        # Motion is still required, but hand presence is also checked.
+        self.motion_threshold = 0.015
         self.motion_burst_required = 2
+
+        # Reject clearly unreliable MediaPipe frames before they enter the
+        # 30-frame sequence. A single missing hand is allowed because many
+        # signs are one-handed; pose + at least one hand are required.
+        self.min_shoulder_visibility = 0.50
 
         # The previously working recognizer used 0 here.
         # This prevents idle frames from contaminating the gesture.
@@ -181,6 +188,52 @@ class ISLInferenceWorker(QThread):
             window_size=self.smoothing_window,
             confidence_threshold=self.confidence_threshold
         )
+
+    def landmark_quality_ok(self, results, normalized_features):
+        """Return True when the current MediaPipe frame is usable for inference.
+
+        This is intentionally conservative: pose landmarks and both shoulder
+        landmarks must be reliable enough for the existing normalization, and
+        at least one hand must be detected. We do not require both hands so
+        one-handed signs remain valid.
+        """
+        try:
+            if not results.pose_landmarks:
+                return False
+
+            pose = results.pose_landmarks.landmark
+            if len(pose) < 13:
+                return False
+
+            left_shoulder = pose[11]
+            right_shoulder = pose[12]
+
+            if (
+                left_shoulder.visibility < self.min_shoulder_visibility
+                or right_shoulder.visibility < self.min_shoulder_visibility
+            ):
+                return False
+
+            # At least one hand must be visible. This prevents idle/body
+            # movement from opening a capture window when the hands are not
+            # actually being tracked.
+            if (
+                results.left_hand_landmarks is None
+                and results.right_hand_landmarks is None
+            ):
+                return False
+
+            features = np.asarray(normalized_features, dtype=np.float32)
+            if features.shape != (self.feature_dimension,):
+                return False
+
+            if not np.all(np.isfinite(features)):
+                return False
+
+            return True
+
+        except Exception:
+            return False
 
     @staticmethod
     def calculate_motion(current_features, previous_features):
@@ -409,15 +462,26 @@ class ISLInferenceWorker(QThread):
                 dtype=np.float32
             )
 
+            frame_quality_ok = self.landmark_quality_ok(
+                results,
+                normalized_features
+            )
+
             motion = self.calculate_motion(
                 normalized_features,
                 previous_features
             )
             previous_features = normalized_features.copy()
 
-            is_moving = motion > self.motion_threshold
+            # Motion is only allowed to start a gesture when MediaPipe is
+            # actually tracking the pose and at least one hand. This avoids
+            # opening capture windows because of noisy body/landmark motion.
+            is_moving = (
+                frame_quality_ok
+                and motion > self.motion_threshold
+            )
 
-            if self.pre_motion_frames > 0:
+            if self.pre_motion_frames > 0 and frame_quality_ok:
                 pre_motion_buffer.append(
                     normalized_features.copy()
                 )
@@ -453,9 +517,12 @@ class ISLInferenceWorker(QThread):
             # ========================================================
             elif state == "CAPTURING":
 
-                sequence_buffer.append(
-                    normalized_features.copy()
-                )
+                # Do not let a clearly broken MediaPipe frame enter the TCN
+                # input. The sequence advances only with usable frames.
+                if frame_quality_ok:
+                    sequence_buffer.append(
+                        normalized_features.copy()
+                    )
 
                 if len(sequence_buffer) >= self.sequence_length:
 
