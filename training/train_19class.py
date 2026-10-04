@@ -25,7 +25,7 @@ RAW_DIR = "raw_dataset"
 INCLUDE_DIR = "include_processed"
 
 # Save as a NEW model
-MODEL_PATH = "trained_models/isl_tcn_19class_v3.pth"
+MODEL_PATH = "trained_models/isl_tcn_19class_v4.pth"
 
 CLASSES = [
     "GOOD",

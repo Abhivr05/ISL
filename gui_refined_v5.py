@@ -128,7 +128,7 @@ class ISLInferenceWorker(QThread):
     frame_ready = pyqtSignal(QImage)
     status_updated = pyqtSignal(dict)
 
-    def __init__(self, model_path="trained_models/isl_tcn_19class_v3.pth"):
+    def __init__(self, model_path="trained_models/isl_tcn_19class_v4.pth"):
         super().__init__()
 
         self.model_path = model_path
