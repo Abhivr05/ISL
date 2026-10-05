@@ -25,7 +25,7 @@ RAW_DIR = "raw_dataset"
 INCLUDE_DIR = "include_processed"
 
 # Save as a NEW model
-MODEL_PATH = "trained_models/isl_tcn_19class_v4.pth"
+MODEL_PATH = "trained_models/isl_tcn_22class_v7.pth"
 
 CLASSES = [
     "GOOD",
@@ -46,6 +46,12 @@ CLASSES = [
     "TODAY",
     "TOMORROW",
     "YESTERDAY",
+
+    # New vocabulary
+    "HAPPY",
+    "SICK",
+    "HEALTHY",
+    "FRIEND",
 ]
 
 TARGET_PER_CLASS = 40
@@ -306,7 +312,7 @@ all_samples = []
 all_labels = []
 
 print("=" * 60)
-print("BUILDING 19-CLASS DATASET - V3")
+print("BUILDING 22-CLASS DATASET - V5")
 print("=" * 60)
 
 for label, class_name in enumerate(CLASSES):

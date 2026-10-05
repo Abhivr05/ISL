@@ -177,6 +177,64 @@ class SentenceGenerator:
         if words == ["YOU", "WHY"]:
             return "Why?"
 
+        if words == ["I", "HAPPY"]:
+            return "I am happy"
+
+        if words == ["I", "SICK"]:
+            return "I am sick"
+
+        if words == ["I", "HEALTHY"]:
+            return "I am healthy"
+
+        if words == ["YOU", "HAPPY"]:
+            return "You are happy"
+
+        if words == ["YOU", "SICK"]:
+            return "You are sick"
+
+        if words == ["YOU", "HEALTHY"]:
+            return "You are healthy"
+
+                # YOU + I + FRIEND
+        if words == ["YOU", "I", "FRIEND"]:
+            return "You are my friend."
+
+                # I + HAPPY + TODAY
+        if words == ["I", "HAPPY", "TODAY"]:
+            return "I am happy today."
+
+        # I + SICK + TODAY
+        if words == ["I", "SICK", "TODAY"]:
+            return "I am sick today."
+
+        # I + HEALTHY + TODAY
+        if words == ["I", "HEALTHY", "TODAY"]:
+            return "I am healthy today."
+
+        # I + HOME
+        if words == ["I", "HOME"]:
+            return "I am at home."
+
+        # I + SCHOOL
+        if words == ["I", "SCHOOL"]:
+            return "I am at school."
+
+        # I + HOSPITAL
+        if words == ["I", "HOSPITAL"]:
+            return "I am at the hospital."
+
+        # YOU + HOME
+        if words == ["YOU", "HOME"]:
+            return "You are at home."
+
+        # YOU + SCHOOL
+        if words == ["YOU", "SCHOOL"]:
+            return "You are at school."
+
+        # YOU + HOSPITAL
+        if words == ["YOU", "HOSPITAL"]:
+            return "You are at the hospital."
+
         # --------------------------------------------------
         # Single-word output
         # --------------------------------------------------
@@ -246,6 +304,15 @@ if __name__ == "__main__":
         ["YOU", "WHERE"],
         ["YOU", "HOW"],
         ["GOOD", "WATER"],
+        ["I", "HAPPY", "TODAY"],
+        ["I", "SICK", "TODAY"],
+        ["I", "HEALTHY", "TODAY"],
+        ["I", "HOME"],
+        ["I", "SCHOOL"],
+        ["I", "HOSPITAL"],
+        ["YOU", "HOME"],
+        ["YOU", "SCHOOL"],
+        ["YOU", "HOSPITAL"],
     ]
 
     for words in test_cases:
